@@ -83,9 +83,10 @@ let main argv =
         let sigma = p.GetValue("sigma")
 
         let sub first second = Seq.zip first second |> Seq.map( fun (x, y) -> x - y)
+        let sqr_seq seq = seq |> Seq.map(fun(x) ->x * x)
 
         let cur_dif_pat = mesh_grid |> Seq.map(fun (x, y) -> I(x, y, p1, a1, b1, 1. - p1, a2, b2, lmbda, z))
-        let error = - sqr (Seq.sum(sub dif_pat cur_dif_pat)) / (2. * sqr sigma) - float (height * width) * Math.Log(sigma * Math.Sqrt(2. * Math.PI))
+        let error = - (Seq.sum(sqr_seq (sub dif_pat cur_dif_pat))) / (2. * sqr sigma) - float (height * width) * Math.Log(sigma * Math.Sqrt(2. * Math.PI))
         error
 
     let prior = 
