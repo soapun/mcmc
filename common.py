@@ -29,20 +29,20 @@ class DiffractionPatternGenerator:
                  z=65_000,
                  lmbda=0.63,
                  max_angle_degree=15,
-                 n_points=1000):
+                 shape=(1000, 1000)):
         self.z = tf.Variable(z, dtype=float)
         self.lmbda = tf.Variable(lmbda, dtype=float)
         self.k = tf.Variable(2 *np.pi/lmbda, dtype=float)
         
         max_angle_degree = 15;
-        max_angle = max_angle_degree * np.pi / 180;
+        max_angle = max_angle_degree * np.pi / 180
 
         x_max = z * np.tan(max_angle)
         y_max = z * np.tan(max_angle)
 
-        n_points = 1000 # resolution of our diffraction pattern picture in both axis
-        x_ar = np.linspace(-x_max, x_max, n_points)
-        y_ar = np.linspace(-y_max, y_max, n_points)
+        #n_points = 1000 # resolution of our diffraction pattern picture in both axis
+        x_ar = np.linspace(-x_max, x_max, shape[0])
+        y_ar = np.linspace(-y_max, y_max, shape[1])
         
         buf = np.meshgrid(y_ar[:y_ar.shape[0]], x_ar[:x_ar.shape[0]])
         self.x_data = tf.Variable(buf[1], dtype=float)
@@ -76,19 +76,33 @@ class DiffractionPatternGenerator:
     
 class DiffMCMCSampler():
     
-    def __init__(self):
-        self.generator = DiffractionPatternGenerator()
+    def __init__(self, parameter_wise=True):
         self.sigma = tf.Variable(0, dtype=float)
         self.pi2 = tf.constant(2 * np.pi, dtype=float)
-    
-    def transition_model(self, params, it, lr):
-        p1, a1, b1, a2, b2, sigma = params
-        scale = lr# * 10 ** -(it // 1000)
+        self.parameter_wise=parameter_wise
         
+        self.deltas = tf.Variable(np.array([0.01 for i in range(6)]))
+    
+    def transition_model(self, params, it, deltas):
+        p1, a1, b1, a2, b2, sigma = params        
         loc = np.array([p1, a1, b1, a2, b2, sigma])
-        noise = np.random.normal(loc=0, scale=scale, size=loc.shape[0])
-
-        return loc+noise
+        
+        if self.parameter_wise and np.random.uniform() < 2/3:
+            noise = np.zeros(loc.shape[0])
+            idx = [np.random.randint(0, loc.shape[0])]
+            if idx[0]-1 >= 0 and np.random.uniform() < 0.5:
+                idx.append(idx[0]-1)
+            if idx[0]+1 < loc.shape[0] and np.random.uniform() < 0.5:
+                idx.append(idx[0]+1)
+            for i in idx:
+                noise[i] += np.random.normal(loc=0, scale=deltas[i])
+            
+            alterable = idx
+        else:
+            noise = np.array([np.random.normal(loc=0, scale=j) for j in deltas])             
+            alterable = list(range(loc.shape[0]))
+            
+        return loc+noise, alterable
     
     def prior(self, params):
         p1, a1, b1, a2, b2, sigma = params
@@ -126,26 +140,63 @@ class DiffMCMCSampler():
             accept=np.random.uniform(0,1)
             return (accept < (np.exp(params_new-params)))
         
-    def run_mcmc(self, param_init, num_iterations, true_data, lr):
+    def run_mcmc(self, 
+                 param_init,
+                 burn_in, 
+                 num_iterations, 
+                 true_data, 
+                 lr, 
+                 verbose=0):
+        self.generator = DiffractionPatternGenerator(shape=true_data.shape)
+        self.I_true = tf.Variable(self.generator.getPattern([1,1,1,1,1,1]), dtype=float)
+        self.size = tf.cast(tf.size(self.I_true), float)
+        
         params = param_init
         
-        burn_in = int(num_iterations * 0.4)
-        self.I_true = tf.Variable(true_data, dtype=float)
-        self.size = tf.cast(tf.size(self.I_true), float)
+        self.burn_in = burn_in
+        self.I_true.assign(true_data)
+        self.deltas.assign(np.array([lr for i in range(6)]))
         accepted = []
-        all_params = np.empty([num_iterations, len(params)])
-        states = np.empty([num_iterations, len(params)])
+        all_params = np.empty([int(num_iterations-self.burn_in+1), len(params)])
+        states = np.empty([int(num_iterations-self.burn_in+1), len(params)])
         
         params_lik = self.loglike(params)
+        runalt = np.zeros(len(params))
+        runacc = np.zeros(len(params))
+        deltas = np.array([lr, lr, lr, lr, lr, lr])
+        dmin, dmax = (0.001, 10)
 
-        for i in range(num_iterations):
-            states[i] = params
-            params_new =  self.transition_model(params, i, lr)    
-            params_new_lik = self.loglike(params_new)
+        iterations = range(num_iterations)
+        if verbose:
+            iterations = tqdm(iterations)
+        for i in iterations:
+            if i >= self.burn_in:
+                states[int(i-self.burn_in)] = params
+
+            params_new, alterable =  self.transition_model(params, i, deltas)    
+            params_new_lik = self.loglike(params_new)            
+            runalt[alterable] += 1
+            
             if (self.acceptance(params_lik,params_new_lik)):            
+                runacc[alterable] += 1                
                 params = params_new
                 params_lik = params_new_lik
-                if (i >= burn_in):
+                if (i >= self.burn_in):
                     accepted.append(params_new)  
-            all_params[i] = params_new
+                    
+            if (i < self.burn_in):
+                for j in alterable:
+                    if runalt[j] == 20:
+                        if runacc[j] < 4:
+                            deltas[j] = max (dmin, min(dmax, deltas[j] * 0.8))
+                        elif runacc[j] < 5:
+                            deltas[j] = max (dmin, min(dmax, deltas[j] * 0.9))
+                        elif runacc[j] > 6:
+                            deltas[j] = max (dmin, min(dmax, deltas[j] * 1.2))
+                        elif runacc[j] > 5:
+                            deltas[j] = max (dmin, min(dmax, deltas[j] * 1.1))
+                        runalt[j]=0
+                        runacc[j]=0
+            if i >= self.burn_in:
+                all_params[int(i-self.burn_in)] = params_new
         return np.array(accepted), np.array(states), np.array(all_params)
