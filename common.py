@@ -8,6 +8,7 @@ import os
 import tensorflow as tf
 import pickle
 from itertools import product
+from statsmodels.regression.linear_model import yule_walker
 
 def generateParameters(elongation=4, badcellperc=0.3):
     r = 4
@@ -74,6 +75,10 @@ class DiffractionPatternGenerator:
         
         return self.I_tf()
     
+def spec(x, order=2):
+    beta, sigma = yule_walker(x, order)
+    return sigma**2 / (1. - np.sum(beta))**2    
+    
 class DiffMCMCSampler():
     
     def __init__(self, parameter_wise=True):
@@ -139,7 +144,30 @@ class DiffMCMCSampler():
         else:
             accept=np.random.uniform(0,1)
             return (accept < (np.exp(params_new-params)))
+    
+    def test_of_mean(self, x, first=.5, last=.5, intervals=10):
+        if np.ndim(x) > 1:
+            return [self.test_of_mean(y, first, last, intervals) for y in np.transpose(x)]
+        zscores = []
+
+        starts = np.linspace(int(len(x)*(1.-0.3)), int(len(x)), intervals).astype(int)
+        for i,s in enumerate(starts):
+            x_trunc = x[s:]
+            n = len(x_trunc)
+            
+            first_slice = x_trunc[:int(first * n)]
+            last_slice = x_trunc[int(last * n):]
+
+            z = (first_slice.mean() - last_slice.mean())
+            
+            #z /= np.sqrt(spec(first_slice)/len(first_slice) +
+            #             spec(last_slice)/len(last_slice))
+            
+            zscores.append(z)
+
+        return np.mean(zscores[:-1])
         
+    
     def run_mcmc(self, 
                  param_init,
                  burn_in, 
@@ -156,22 +184,29 @@ class DiffMCMCSampler():
         self.burn_in = burn_in
         self.I_true.assign(true_data)
         self.deltas.assign(np.array([lr for i in range(6)]))
+        
         accepted = []
-        all_params = np.empty([int(num_iterations-self.burn_in+1), len(params)])
-        states = np.empty([int(num_iterations-self.burn_in+1), len(params)])
+        all_params = np.empty([int(num_iterations), len(params)])
+        states = np.empty([int(num_iterations), len(params)])
+        
+        burn_in_params = []
+        
         
         params_lik = self.loglike(params)
         runalt = np.zeros(len(params))
         runacc = np.zeros(len(params))
         deltas = np.array([lr, lr, lr, lr, lr, lr])
         dmin, dmax = (0.001, 10)
-
+        i=0
         iterations = range(num_iterations)
-        if verbose:
-            iterations = tqdm(iterations)
-        for i in iterations:
-            if i >= self.burn_in:
-                states[int(i-self.burn_in)] = params
+        
+        def probe(burnIn):
+            nonlocal params
+            nonlocal params_lik
+            nonlocal i
+            
+            if not burnIn:
+                states[i] = params
 
             params_new, alterable =  self.transition_model(params, i, deltas)    
             params_new_lik = self.loglike(params_new)            
@@ -181,10 +216,10 @@ class DiffMCMCSampler():
                 runacc[alterable] += 1                
                 params = params_new
                 params_lik = params_new_lik
-                if (i >= self.burn_in):
+                if not burnIn:
                     accepted.append(params_new)  
                     
-            if (i < self.burn_in):
+            if (burnIn):
                 for j in alterable:
                     if runalt[j] == 20:
                         if runacc[j] < 4:
@@ -197,6 +232,32 @@ class DiffMCMCSampler():
                             deltas[j] = max (dmin, min(dmax, deltas[j] * 1.1))
                         runalt[j]=0
                         runacc[j]=0
-            if i >= self.burn_in:
-                all_params[int(i-self.burn_in)] = params_new
-        return np.array(accepted), np.array(states), np.array(all_params)
+            if not burnIn:
+                all_params[i] = params_new
+            else:
+                burn_in_params.append(params_new)
+        
+        
+        
+        if verbose:
+            iterations = tqdm(iterations)
+            
+        if isinstance(self.burn_in, int):
+            for i in range(burn_in):
+                probe(True)
+    
+        elif burn_in == 'auto':
+            k = 1
+            while True:
+                probe(True)
+                if k%500==0:
+                    buf=(self.test_of_mean(burn_in_params)< deltas*2)
+                    if buf.all():
+                        break
+                if k == 30_000:
+                    break
+                k+=1
+                
+        for i in iterations:
+            probe(False)
+        return np.array(accepted), np.array(states), np.array(burn_in_params), np.array(all_params)
